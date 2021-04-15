@@ -1,122 +1,139 @@
-import argparse
-import pickle
-from collections import namedtuple
-from itertools import count
-
-import os, time
 import numpy as np
-import matplotlib.pyplot as plt
-
-import gym
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from torch.distributions import Normal,Categorical
-from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
-from tensorboardX import SummaryWriter
+from torch import optim
+import matplotlib.pyplot as plt
+import gym
 
-# hyper-paramters
-seed = 1
-render = False
-num_episodes = 400000
-env = gym.make('MountainCar-v0').unwrapped
-num_state = env.observation_space.shape[0]
-num_action = env.action_space.n
-torch.manual_seed(seed)
-env.seed(seed)
 
-Transition = namedtuple('Transition', ['state', 'action', 'reward', 'next_state'])
+#hyper parameters
+EPSILON = 0.9
+GAMMA = 0.9
+LR = 0.01
+MEMORY_CAPACITY = 2000
+Q_NETWORK_ITERATION = 100
+BATCH_SIZE = 32
+
+EPISODES = 400
+env = gym.make('MountainCar-v0')
+env = env.unwrapped
+NUM_STATES = env.observation_space.shape[0] # 2
+NUM_ACTIONS = env.action_space.n
+
 
 class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
-        self.fc1 = nn.Linear(num_state, 100)
-        self.fc2 = nn.Linear(100, num_action)
 
-    def reward(self, x):
-        x = F.relu(self.fc1(x))
-        action_prob = self.fc2(x)
-        return action_prob
+        self.fc1 = nn.Linear(NUM_STATES, 30)
+        self.fc1.weight.data.normal_(0, 0.1)
+        self.fc2 = nn.Linear(30, NUM_ACTIONS)
+        self.fc2.weight.data.normal_(0, 0.1)
 
 
-class DQN():
-    capacity = 8000
-    learning_rate = 1e-3
-    memory_count = 0
-    batch_size = 256
-    gamma = 0.995
-    update_count = 0
+    def forward(self, x):
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.fc2(x)
 
+        return x
+
+class Dqn():
     def __init__(self):
-        super(DQN, self).__init__()
-        self.target_net, self.act_net = Net(), Net()
-        self.memory = [None]*self.capacity
-        self.optimzer = optim.Adam(self.act_net.parameters(), self.learning_rate)
-        self.loss_func = nn.MSELoss()
-        self.writer = SummaryWriter('./DQN/logs')
+        self.eval_net, self.target_net = Net(), Net()
+        self.memory = np.zeros((MEMORY_CAPACITY, NUM_STATES * 2 + 2))  # initialize memory
+        # state, action ,reward and next state
+        self.memory_counter = 0
+        self.learn_counter = 0  # for target updating
+        self.optimizer = optim.Adam(self.eval_net.parameters(), LR)
+        self.loss = nn.MSELoss()
 
-    def select_action(self, state):
-        state = torch.tensor(state, dtype=torch.float).unsqueeze(0)
-        value = self.act_net(state)
-        action_max_value, index = torch.max(value)
-        action = index.item()
-        if np.random.rand(1) >= 0.9:
-            action = np.random.choice(range(num_action), 1)
+        self.fig, self.ax = plt.subplots()
+
+    def store_trans(self, state, action, reward, next_state):
+        if self.memory_counter % 500 ==0:
+            print("The experience pool collects {} time experience".format(self.memory_counter))
+        # replace the old memory with new memory
+        index = self.memory_counter % MEMORY_CAPACITY
+        trans = np.hstack((state, [action], [reward], next_state))
+        self.memory[index, :] = trans
+        self.memory_counter += 1
+
+    def choose_action(self, state):
+        # notation that the function return the action's index nor the real action
+        # EPSILON
+        state = torch.unsqueeze(torch.FloatTensor(state), 0)
+        # input only one sample
+        if np.random.randn() <= EPSILON:
+            action_value = self.eval_net.forward(state)
+            action = torch.max(action_value, 1)[1].data.numpy()  # get action whose q is max
+            action = action[0]  # get the action index
+        else:
+            action = np.random.randint(0, NUM_ACTIONS)
         return action
 
-    def store_transition(self, transition):
-        index = self.memory_count % self.capacity
-        self.memory[index] = transition
-        self.memory_count += 1
-        return self.memory_count >= self.capacity
+    def plot(self, ax, x):
+        ax.cla()
+        ax.set_xlabel("episode")
+        ax.set_ylabel("total reward")
+        ax.plot(x, 'b-')
+        plt.pause(0.000000000000001)
 
-    def update(self):
-        if self.memory_count >= self.capacity:
-            state = torch.tensor([t.state for t in self.memory]).float()
-            action = torch.LongTensor([t.action for t in self.memory]).view(-1, 1).long()
-            reward = torch.tensor([t.reward for t in self.memory]).float()
-            next_state = torch.tensor([t.next_reward for t in self.memory]).float()
+    def learn(self):
+        # learn 100 times then the target network update
+        if self.learn_counter % Q_NETWORK_ITERATION == 0:
+            self.target_net.load_state_dict(self.eval_net.state_dict())
+        self.learn_counter += 1
 
-            reward = (reward - reward.mean()) / (reward.std() + 1e-7)
-            with torch.no_grad():
-                target_v = reward + self.gamma * self.target_net(next_state).max(1)[0]
+        # sample batch transitions
+        sample_index = np.random.choice(MEMORY_CAPACITY, BATCH_SIZE)
+        batch_memory = self.memory[sample_index, :]
+        batch_state = torch.FloatTensor(batch_memory[:, :NUM_STATES])
+        # note that the action must be a int
+        batch_action = torch.LongTensor(batch_memory[:, NUM_STATES:NUM_STATES+1].astype(int))
+        batch_reward = torch.FloatTensor(batch_memory[:, NUM_STATES+1: NUM_STATES+2])
+        batch_next_state = torch.FloatTensor(batch_memory[:, -NUM_STATES:])
 
-            for index in BatchSampler(SubsetRandomSampler(range(len(self.memory))), batch_size=self.batch_size, drop_last=False):
-                v = (self.act_net(state).gather(1, action))[index]
-                loss = self.loss_func(target_v[index].unsqueeze(1), (self.act_net(state).gather(1, action))[index])
-                self.optimzer.zero_grad()
-                loss.backward()
-                self.optimzer.step()
-                self.writer.add_scalar('loss/value_loss', loss, self.update_count)
-                self.update_count += 1
-                if self.update_count % 100 == 0:
-                    self.target_net.load_state_dict(self.act_net.state_dict())
-        else:
-            print("Memory Buff is too less")
+        # q_eval w.r.t the action in experience
+        q_eval = self.eval_net(batch_state).gather(1, batch_action)  # shape (batch, 1)
+        q_next = self.target_net(batch_next_state).detach()  # detach from graph, don't backpropagate
+        q_target = batch_reward + GAMMA*q_next.max(1)[0].view(BATCH_SIZE, 1)  # shape (batch, 1)
+
+        loss = self.loss(q_eval, q_target)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
 
 
 def main():
-
-    agent = DQN()
-
-    for i_ep in range(num_episodes):
+    net = Dqn()
+    print("The DQN is collecting experience...")
+    step_counter_list = []
+    for episode in range(EPISODES):
         state = env.reset()
-
-        if render: env.render()
-        for t in range(10000):
-            action = agent.select_action(state)
+        step_counter = 0
+        while True:
+            step_counter +=1
+            env.render()
+            # take action
+            action = net.choose_action(state)
+            # modify the reward
             next_state, reward, done, info = env.step(action)
-            if render: env.render()
-            transition = Transition(state, action, reward, num_state)
-            agent.store_transition(transition)
-            state = next_state
-            if done or t >= 9999:
-                agent.writer.add_scalar('live/finish_step', t+1, global_step=i_ep)
-                agent.update()
-                if i_ep % 10 == 0:
-                    print('episodes{}, step is{}'.format(i_ep, t))
+            reward = reward * 100 if reward > 0 else reward * 5
+            net.store_trans(state, action, reward, next_state)
+
+            if net.memory_counter >= MEMORY_CAPACITY:
+                net.learn()
+                if done:
+                    print("episode {}, the reward is {}".format(episode, round(reward, 3)))
+            if done:
+                step_counter_list.append(step_counter)
+                net.plot(net.ax, step_counter_list)
                 break
+
+            state = next_state
 
 
 if __name__ == '__main__':
