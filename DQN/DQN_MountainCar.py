@@ -115,7 +115,7 @@ def main():
         state = env.reset()
         step_counter = 0
         while True:
-            step_counter +=1
+            step_counter += 1
             env.render()
             # take action
             action = net.choose_action(state)
