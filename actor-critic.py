@@ -1,105 +1,128 @@
-import gym
+import gym, os
 import numpy as np
+import matplotlib.pyplot as plt
+from itertools import count
+from collections import namedtuple
+
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import torch.nn.functional as F
 from torch.distributions import Categorical
-import torch.optim as optim
 
+#Parameters
+env = gym.make('CartPole-v0')
+env = env.unwrapped
+
+env.seed(1)
+torch.manual_seed(1)
+
+state_space = env.observation_space.shape[0]
+action_space = env.action_space.n
+
+
+#Hyperparameters
+learning_rate = 0.01
 gamma = 0.99
-lr = 0.02
-betas = (0.9, 0.999)
-random_seed = 543
-torch.manual_seed(random_seed)
-env = gym.make('LunarLander-v2')
-env.seed(random_seed)
+episodes = 20000
+render = False
+eps = np.finfo(np.float32).eps.item()
+SavedAction = namedtuple('SavedAction', ['log_prob', 'value'])
 
-class ActorCritic(nn.module):
+class Policy(nn.Module):
     def __init__(self):
-        super(ActorCritic, self).__init__()
-        self.affine = nn.Linear(8, 128)
+        super(Policy, self).__init__()
+        self.fc1 = nn.Linear(state_space, 32)
 
-        self.action_layer = nn.Linear(128, 4)
-        self.value_layer = nn.Linear(128, 1)
+        self.action_head = nn.Linear(32, action_space)
+        self.value_head = nn.Linear(32, 1) # Scalar Value
 
-        self.logprobs = []
-        self.state_values = []
+        self.save_actions = []
         self.rewards = []
+        os.makedirs('./AC_CartPole-v0', exist_ok=True)
 
-    def forward(self, state):
-        state = torch.from_numpy(state).float()
-        state = F.relu(self.affine(state))
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        action_score = self.action_head(x)
+        state_value = self.value_head(x)
 
-        state_value = self.value_layer(state)
+        return F.softmax(action_score, dim=-1), state_value
 
-        action_probs = F.softmax(self.action_layer(state))
-        action_distribution = Categorical(action_probs)
-        action = action_distribution.sample()
+model = Policy()
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-        self.logprobs.append(action_distribution.log_prob(action))
-        self.state_values.append(state_value)
+def plot(steps):
+    ax = plt.subplot(111)
+    ax.cla()
+    ax.grid()
+    ax.set_title('Training')
+    ax.set_xlabel('Episode')
+    ax.set_ylabel('Run Time')
+    ax.plot(steps)
+    RunTime = len(steps)
 
-        return action.item()
+    path = './AC_CartPole-v0/' + 'RunTime' + str(RunTime) + '.jpg'
+    if len(steps) % 200 == 0:
+        plt.savefig(path)
+    plt.pause(0.0000001)
 
-    def calculateLoss(self, gamma=0.99):
-        # calculating discounted rewards
-        rewards = []
-        dis_reward = 0
-        for rewards in self.rewards[::-1]:
-            dis_reward = reward + gamma * dis_reward
-            rewards.insert(0, dis_reward)
+def select_action(state):
+    state = torch.from_numpy(state).float()
+    probs, state_value = model(state)
+    m = Categorical(probs)
+    action = m.sample()
+    model.save_actions.append(SavedAction(m.log_prob(action), state_value))
 
-        # normalizing the rewards:
-        rewards = torch.tensor(rewards)
-        rewards = (rewards - rewards.means()) / (rewards.std())
-
-        loss = 0
-        for logprob, value, reward in zip(self.logprobs, self.state_values, rewards):
-            advantage = reward - value.item()
-            action_loss = -logprob * advantage
-            value_loss = F.smooth_l1_loss(value, reward)
-            loss += (action_loss + value_loss)
-
-        return loss
-
-    def clearMenory(self):
-        del self.logprobs[:]
-        del self.state_value[:]
-        del self.rewards[:]
+    return action.item()
 
 
-print('\nCollecting experience...')
-for i_episode in range(0, 10000):
-    state = env.reset()
-    for t in range(10000):
-        action = dqn.choose_action(state)
-        state, reward, done, _ = env.step(action)
-        policy.rewards.append(reward)
-        running_reward += reward
-        if render and i_episode > 1000:
-            env.render()
-        if done:
-            break
+def finish_episode():
+    R = 0
+    save_actions = model.save_actions
+    policy_loss = []
+    value_loss = []
+    rewards = []
 
-    # Updating the policy :
+    for r in model.rewards[::-1]:
+        R = r + gamma * R
+        rewards.insert(0, R)
+
+    rewards = torch.tensor(rewards)
+    rewards = (rewards - rewards.mean()) / (rewards.std() + eps)
+
+    for (log_prob , value), r in zip(save_actions, rewards):
+        reward = r - value.item()
+        policy_loss.append(-log_prob * reward)
+        value_loss.append(F.smooth_l1_loss(value, torch.tensor([r])))
+
     optimizer.zero_grad()
-    loss = policy.calculateLoss(gamma)
+    loss = torch.stack(policy_loss).sum() + torch.stack(value_loss).sum()
     loss.backward()
     optimizer.step()
-    policy.clearMemory()
 
-    # saving the model if episodes > 999 OR avg reward > 200
-    # if i_episode > 999:
-    #    torch.save(policy.state_dict(), './preTrained/LunarLander_{}_{}_{}.pth'.format(lr, betas[0], betas[1]))
+    del model.rewards[:]
+    del model.save_actions[:]
 
-    if running_reward > 4000:
-        torch.save(policy.state_dict(), './preTrained/LunarLander_{}_{}_{}.pth'.format(lr, betas[0], betas[1]))
-        print("########## Solved! ##########")
-        test(name='LunarLander_{}_{}_{}.pth'.format(lr, betas[0], betas[1]))
-        break
+def main():
+    running_reward = 10
+    live_time = []
+    for i_episode in count(episodes):
+        state = env.reset()
+        for t in count():
+            action = select_action(state)
+            state, reward, done, info = env.step(action)
+            if render: env.render()
+            model.rewards.append(reward)
 
-    if i_episode % 20 == 0:
-        running_reward = running_reward / 20
-        print('Episode {}\tlength: {}\treward: {}'.format(i_episode, t, running_reward))
-        running_reward = 0
+            if done or t >= 1000:
+                break
+        running_reward = running_reward * 0.99 + t * 0.01
+        live_time.append(t)
+        plot(live_time)
+        if i_episode % 100 == 0:
+            modelPath = './AC_CartPole_Model/ModelTraing'+str(i_episode)+'Times.pkl'
+            torch.save(model, modelPath)
+        finish_episode()
 
+if __name__ == '__main__':
+    main()
